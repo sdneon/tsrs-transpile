@@ -1,0 +1,398 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 3a21748..05402b2 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1498,6 +1498,7 @@ dependencies = [
+ name = "tsrs_wasm"
+ version = "0.18.0"
+ dependencies = [
++ "rustc-hash",
+  "tsrs_api",
+  "tsrs_ast",
+  "tsrs_compiler",
+@@ -1506,6 +1507,7 @@ dependencies = [
+  "tsrs_diagnostics",
+  "tsrs_execute",
+  "tsrs_scanner",
++ "tsrs_tsoptions",
+  "tsrs_vfs",
+ ]
+ 
+diff --git a/crates/tsrs_wasm/Cargo.toml b/crates/tsrs_wasm/Cargo.toml
+index 4ca1855..94199d4 100644
+--- a/crates/tsrs_wasm/Cargo.toml
++++ b/crates/tsrs_wasm/Cargo.toml
+@@ -22,8 +22,10 @@ tsrs_core.workspace = true
+ tsrs_ast.workspace = true
+ tsrs_diagnostics.workspace = true
+ tsrs_scanner.workspace = true
+-tsrs_vfs.workspace = true
++tsrs_vfs = { workspace = true, features = ["noembed"] }
+ tsrs_compiler.workspace = true
++tsrs_tsoptions.workspace = true
++rustc-hash.workspace = true
+ tsrs_execute = { path = "../tsrs_execute" }
+ tsrs_contentmapper = { path = "../tsrs_contentmapper" }
+ 
+diff --git a/crates/tsrs_wasm/src/lib.rs b/crates/tsrs_wasm/src/lib.rs
+index 1289395..2790e61 100644
+--- a/crates/tsrs_wasm/src/lib.rs
++++ b/crates/tsrs_wasm/src/lib.rs
+@@ -13,6 +13,7 @@
+ mod host;
+ mod json;
+ mod sys;
++pub mod transpile;
+ 
+ use std::io::Write;
+ use std::sync::{Arc, Mutex};
+@@ -74,6 +75,7 @@ mod abi {
+     thread_local! {
+         static INPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+         static OUTPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
++        static MAP: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+     }
+ 
+     #[unsafe(no_mangle)]
+@@ -98,11 +100,42 @@ mod abi {
+         status
+     }
+ 
++    /// Fork addition. Request in the input buffer: `fileName \0 compilerOptionsJson \0 source`. Returns 0 and the
++    /// emitted JS as the reply, or 1 and an error message.
++    #[unsafe(no_mangle)]
++    pub extern "C" fn tsrs_transpile() -> i32 {
++        let default_hook = std::panic::take_hook();
++        std::panic::set_hook(Box::new(move |info| {
++            default_hook(info);
++            std::process::exit(5);
++        }));
++        tsrs_compiler::worker_pool();
++        let request = INPUT.with_borrow_mut(std::mem::take);
++        let (status, reply, map) = match super::transpile::run_transpile(&request) {
++            Ok((js, map)) => (0, js.into_bytes(), map.into_bytes()),
++            Err(e) => (1, e.into_bytes(), Vec::new()),
++        };
++        MAP.with_borrow_mut(|m| *m = map);
++        OUTPUT.with_borrow_mut(|output| *output = reply);
++        status
++    }
++
+     #[unsafe(no_mangle)]
+     pub extern "C" fn tsrs_output() -> *const u8 {
+         OUTPUT.with_borrow(Vec::as_ptr)
+     }
+ 
++    /// Fork addition: the source map JSON of the last `tsrs_transpile` (empty unless `sourceMap` was set).
++    #[unsafe(no_mangle)]
++    pub extern "C" fn tsrs_map() -> *const u8 {
++        MAP.with_borrow(Vec::as_ptr)
++    }
++
++    #[unsafe(no_mangle)]
++    pub extern "C" fn tsrs_map_len() -> usize {
++        MAP.with_borrow(Vec::len)
++    }
++
+     #[unsafe(no_mangle)]
+     pub extern "C" fn tsrs_output_len() -> usize {
+         OUTPUT.with_borrow(Vec::len)
+diff --git a/crates/tsrs_wasm/src/transpile.rs b/crates/tsrs_wasm/src/transpile.rs
+new file mode 100644
+index 0000000..b178f26
+--- /dev/null
++++ b/crates/tsrs_wasm/src/transpile.rs
+@@ -0,0 +1,293 @@
++// Modified/added for the Node.JS+ fork (tsrs-transpile project) - NOT part of upstream tsrs. Apache-2.0, derived from
++// tsrs (oxc-project/tsrs) which is derived from TypeScript (Microsoft). See NOTICE.tsrs / LICENSE.tsrs next to this patch.
++// Fork addition: tsrs' single-file `transpile` (copied from tsrs_api/src/transpile.rs minus the API-server types) so the
++// wasm module can export it without linking the language server / project crates.
++use std::sync::{Arc, Mutex};
++use std::time::SystemTime;
++
++use rustc_hash::FxHashMap;
++use tsrs_compiler::{EmitOnly, EmitOptions, ProgramOptions, WriteFileData};
++use tsrs_core::context::Context;
++use tsrs_core::{CompilerOptions, JsxEmit, P, Tristate, tspath};
++use tsrs_vfs::{Entries, FS, FileInfo};
++
++const INPUT_DIRECTORY: &str = "/";
++const LIB_DIRECTORY: &str = "/lib";
++
++const BAREBONES_LIB_CONTENT: &str = "interface Boolean {}
++interface Function {}
++interface CallableFunction {}
++interface NewableFunction {}
++interface IArguments {}
++interface Number {}
++interface Object {}
++interface RegExp {}
++interface String {}
++interface Array<T> { length: number; [n: number]: T; }
++interface SymbolConstructor {
++    (desc?: string | number): symbol;
++    for(name: string): symbol;
++    readonly toStringTag: symbol;
++}
++declare var Symbol: SymbolConstructor;
++interface Symbol {
++    readonly [Symbol.toStringTag]: string;
++}";
++
++/// Go `transpileFS`: only the synthesized files exist. Go panics on any other access; here unexpected
++/// access is recorded and turned into an error after the program is built.
++struct TranspileFS {
++    files: FxHashMap<String, String>,
++    unexpected: Mutex<Option<String>>,
++}
++
++impl TranspileFS {
++    fn note(&self, what: &str, path: &str) {
++        let mut u = self.unexpected.lock().unwrap();
++        if u.is_none() {
++            *u = Some(format!("unexpected {what} for {path:?}"));
++        }
++    }
++}
++
++impl FS for TranspileFS {
++    fn use_case_sensitive_file_names(&self) -> bool {
++        true
++    }
++    fn file_exists(&self, path: &str) -> bool {
++        let ok = self.files.contains_key(path);
++        if !ok {
++            self.note("file existence check", path);
++        }
++        ok
++    }
++    fn read_file(&self, path: &str) -> Option<String> {
++        let r = self.files.get(path).cloned();
++        if r.is_none() {
++            self.note("file read", path);
++        }
++        r
++    }
++    fn write_file(&self, path: &str, _data: &str) -> Result<(), String> {
++        Err(format!("unexpected write for {path:?}"))
++    }
++    fn append_file(&self, path: &str, _data: &str) -> Result<(), String> {
++        Err(format!("unexpected append for {path:?}"))
++    }
++    fn remove(&self, path: &str) -> Result<(), String> {
++        Err(format!("unexpected remove for {path:?}"))
++    }
++    fn chtimes(&self, path: &str, _a: SystemTime, _m: SystemTime) -> Result<(), String> {
++        Err(format!("unexpected chtimes for {path:?}"))
++    }
++    fn directory_exists(&self, path: &str) -> bool {
++        self.note("directory existence check", path);
++        false
++    }
++    fn get_accessible_entries(&self, path: &str) -> Entries {
++        self.note("directory listing", path);
++        Entries::default()
++    }
++    fn stat(&self, path: &str) -> Option<FileInfo> {
++        self.note("stat", path);
++        None
++    }
++    fn realpath(&self, path: &str) -> String {
++        self.note("realpath request", path);
++        path.to_string()
++    }
++}
++
++pub struct TranspileOutput {
++    pub output_text: String,
++    /// Already serialized (the diagnostics themselves live in the freed scratch region).
++    pub diagnostics: Vec<String>,
++    pub source_map_text: String,
++}
++
++/// Go `transpileWorker` in a scratch region (see the module comment).
++pub fn transpile(
++    input: &str,
++    base: Option<&CompilerOptions>,
++    file_name: &str,
++    report_diagnostics: bool,
++    declaration: bool,
++) -> Result<TranspileOutput, String> {
++    let region = tsrs_core::arena::Region::new(1 << 20);
++    let result = {
++        let _scope = region.enter();
++        transpile_in_current_region(input, base, file_name, report_diagnostics, declaration)
++    };
++    drop(region);
++    result
++}
++
++fn transpile_in_current_region(
++    input: &str,
++    base: Option<&CompilerOptions>,
++    file_name: &str,
++    report_diagnostics: bool,
++    declaration: bool,
++) -> Result<TranspileOutput, String> {
++    let mut opts = base.cloned().unwrap_or_default();
++    opts.incremental = Tristate::Unknown;
++    opts.declaration = Tristate::Unknown;
++    opts.emit_declaration_only = Tristate::Unknown;
++    opts.no_emit = Tristate::Unknown;
++    opts.lib = None;
++    opts.out_file = String::new();
++    opts.composite = Tristate::Unknown;
++    opts.ts_build_info_file = String::new();
++    opts.paths = None;
++    opts.root_dirs = None;
++    opts.types = None;
++    opts.allow_importing_ts_extensions = Tristate::Unknown;
++    opts.no_emit_on_error = Tristate::Unknown;
++    opts.declaration_dir = String::new();
++    if !opts.verbatim_module_syntax.is_true() {
++        opts.isolated_modules = Tristate::True;
++    }
++    opts.no_check = Tristate::True;
++    opts.no_resolve = Tristate::True;
++    opts.suppress_output_path_check = Tristate::True;
++    opts.allow_non_ts_extensions = Tristate::True;
++    if declaration {
++        opts.declaration = Tristate::True;
++        opts.emit_declaration_only = Tristate::True;
++        opts.isolated_declarations = Tristate::True;
++        opts.no_lib = Tristate::False;
++    } else {
++        opts.declaration = Tristate::False;
++        opts.declaration_map = Tristate::False;
++        opts.isolated_declarations = Tristate::False;
++        opts.no_lib = Tristate::True;
++    }
++
++    let file_name = if file_name.is_empty() {
++        if opts.jsx != JsxEmit::None { "module.tsx" } else { "module.ts" }
++    } else {
++        file_name
++    };
++    let input_file_name = tspath::get_normalized_absolute_path(file_name, INPUT_DIRECTORY);
++    let mut files = FxHashMap::default();
++    files.insert(input_file_name.clone(), input.to_string());
++    if declaration {
++        let lib = tsrs_tsoptions::get_default_lib_file_name(&opts);
++        files.insert(
++            tspath::combine_paths(LIB_DIRECTORY, &[lib]),
++            BAREBONES_LIB_CONTENT.to_string(),
++        );
++    }
++    let fs = Arc::new(TranspileFS { files, unexpected: Mutex::new(None) });
++    let host = tsrs_compiler::new_compiler_host(
++        INPUT_DIRECTORY,
++        Arc::<TranspileFS>::clone(&fs),
++        LIB_DIRECTORY,
++        None,
++        None,
++        None,
++    );
++    let config = tsrs_tsoptions::new_parsed_command_line(
++        P::new(opts),
++        vec![input_file_name.clone()],
++        Vec::new(),
++        tspath::ComparePathsOptions::default(),
++    );
++    let mut program_options = ProgramOptions::new(P::new(config), host);
++    program_options.skip_module_resolution = true;
++    // Single-threaded: parsing, binding and checking must allocate on this thread so everything lands in the
++    // scratch region (worker threads would allocate into their own never-freed arenas).
++    program_options.single_threaded = Tristate::True;
++    let program = tsrs_compiler::new_program(program_options);
++
++    let ctx = Context::background();
++    let mut all = Vec::new();
++    if report_diagnostics {
++        let source_file = program.get_source_file(&input_file_name);
++        all.extend(program.get_syntactic_diagnostics(&ctx, source_file));
++        all.extend(program.get_config_file_parsing_diagnostics());
++        all.extend(program.get_program_diagnostics());
++    }
++    let outputs: Mutex<(Option<String>, Option<String>)> = Mutex::new((None, None));
++    let write = |name: &str, text: &str, _data: &mut WriteFileData| -> Result<(), String> {
++        let mut o = outputs.lock().unwrap();
++        let slot = if name.to_ascii_lowercase().strip_suffix(".map").is_some() {
++            &mut o.1
++        } else {
++            &mut o.0
++        };
++        if slot.is_some() {
++            return Err(format!("Unexpected multiple outputs, file: {name}"));
++        }
++        *slot = Some(text.to_string());
++        Ok(())
++    };
++    let emit_only = if declaration { EmitOnly::EmitOnlyDts } else { EmitOnly::EmitAll };
++    let result = program.emit(
++        &ctx,
++        &EmitOptions {
++            target_source_files: None,
++            emit_only,
++            force_emit: declaration,
++            write_file: Some(&write),
++        },
++    );
++    all.extend(result.diagnostics);
++    let diagnostics: Vec<String> = all
++        .iter()
++        .filter(|d| matches!(d.category(), tsrs_diagnostics::Category::Error))
++        .map(|d| {
++            let msg = d.localize();
++            match (d.file(), d.pos()) {
++                (Some(file), Some(pos)) => {
++                    let len = u32::try_from(file.text().len()).unwrap_or(u32::MAX);
++                    let (line, ch) = tsrs_scanner::get_ecma_line_and_utf16_character_of_position(
++                        &*file,
++                        pos.min(len),
++                    );
++                    format!("{}:{} TS{}: {}", line + 1, ch + 1, d.code(), msg)
++                }
++                _ => format!("TS{}: {}", d.code(), msg),
++            }
++        })
++        .collect();
++    drop(all);
++    // SAFETY: nothing derived from the program (diagnostics are serialized above) is used after this.
++    unsafe { tsrs_compiler::free_unshared_program(program) };
++    let unexpected = fs.unexpected.lock().unwrap().take();
++    if let Some(err) = unexpected {
++        return Err(format!("transpile: {err}"));
++    }
++    let (output_text, source_map_text) = outputs.into_inner().unwrap();
++    let output_text =
++        output_text.ok_or_else(|| "transpile: Output generation failed".to_string())?;
++    Ok(TranspileOutput {
++        output_text,
++        diagnostics,
++        source_map_text: source_map_text.unwrap_or_default(),
++    })
++}
++
++
++/// Request: `fileName \0 compilerOptionsJson \0 source`. Returns Ok(output js) or Err(message).
++/// Ok((js, source_map_json_or_empty)).
++pub fn run_transpile(request: &[u8]) -> Result<(String, String), String> {
++    let text = tsrs_core::utf8::from_utf8_lossy(request).into_owned();
++    let mut parts = text.splitn(3, '\0');
++    let file_name = parts.next().unwrap_or_default().to_string();
++    let options_json = parts.next().unwrap_or_default();
++    let source = parts.next().unwrap_or_default();
++    let options = if options_json.trim().is_empty() {
++        None
++    } else {
++        let v = tsrs_core::json::unmarshal(options_json)?;
++        Some(tsrs_tsoptions::gojson::compiler_options_from_go_json(&v)?)
++    };
++    let out = transpile(source, options.as_ref(), &file_name, true, false)?;
++    if out.diagnostics.is_empty() {
++        Ok((out.output_text, out.source_map_text))
++    } else {
++        // Syntax errors: Err("diag1\ndiag2\0partial output"); the host may split on NUL for the partial emit.
++        Err(format!("{}\0{}", out.diagnostics.join("\n"), out.output_text))
++    }
++}
